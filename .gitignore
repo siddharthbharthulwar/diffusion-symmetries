@@ -1,0 +1,13 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*.class
+
+# Large files
+*.pth
+*.gif
+
+# Data files
+data/
+*.ubyte
+*.ubyte.gz
