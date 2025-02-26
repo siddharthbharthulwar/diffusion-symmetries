@@ -26,61 +26,6 @@ import numpy as np
 import gc
 from sklearn.datasets import make_moons
 
-@torch.no_grad()
-def sample_steps(model, x_i, n_sample, size, start_timestep, end_timestep):
-    """
-    Sample from the model for a specific range of timesteps.
-    
-    Args:
-        model (PointDiffusion): The diffusion model
-        x_i (torch.Tensor): Initial latent state to start sampling from. If None, starts from random noise
-        n_sample (int): Number of samples to generate
-        size (tuple): Size of each sample (e.g., (2,) for 2D points)
-        start_timestep (int): Starting timestep (must be less than end_timestep)
-        end_timestep (int): Ending timestep
-        
-    Returns:
-        tuple: (final latent tensor, list of intermediate latents)
-    """
-    device = model.device
-    # If no initial latent provided, start from random noise
-    if x_i is None:
-        x_i = torch.randn(n_sample, *size).to(device)
-    else:
-        x_i = x_i.to(device)
-    
-    x_i_store = []
-    
-    for i in range(end_timestep - 1, start_timestep - 1, -1):
-        print(f'sampling timestep {i}', end='\r')
-        t_is = torch.tensor([i / model.n_steps]).to(device)
-        t_is = t_is.repeat(n_sample)
-        
-        # Add noise only if not at the final step
-        z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
-        
-        # Get model prediction and update x_i
-        eps = model.model(x_i, t_is)
-        
-        # Update point estimates using the model's alpha parameters
-        alpha = model.alpha[i]
-        alpha_bar = model.alpha_bar[i]
-        beta = model.beta[i]
-        
-        x_i = 1 / torch.sqrt(alpha) * (
-            x_i - (1 - alpha) / torch.sqrt(1 - alpha_bar) * eps
-        ) + torch.sqrt(beta) * z
-        
-        x_i_store.append(x_i.detach().cpu().numpy())
-    
-    return x_i, x_i_store
-
-def moons_dataset(n=8000):
-    X, _ = make_moons(n_samples=n, random_state=42, noise=0.03)
-    X[:, 0] = (X[:, 0] + 0.3) * 2 - 1
-    X[:, 1] = (X[:, 1] + 0.3) * 3 - 1
-    return torch.from_numpy(X.astype(np.float32))
-
 def circle_dataset(n=8000, radius=1.0, noise=0.025, angle_intervals=None):
     """Creates a dataset of points arranged in a circle with optional noise
     
@@ -161,35 +106,28 @@ class SimplePointMLP(nn.Module):
         # Predict noise
         return self.net(x_t)
 
-def sample_rotation(angles, x, device="cuda"):
-    """
-    Apply different rotation angles to each point in batch
+def sample_rotation(device="cuda"):
+    """Returns a random rotation angle and a function that applies that rotation to points"""
+    # Sample random angle between 0 and 2π
+    angle = torch.rand(1, device=device) * 2 * torch.pi
     
-    Args:
-        angles: Tensor of shape [N] containing rotation angles
-        x: Tensor of shape [N, 2] containing points to rotate
-        device: Device to create tensors on
+    # Create rotation matrix
+    cos_theta = torch.cos(angle)
+    sin_theta = torch.sin(angle)
+    R = torch.tensor([[cos_theta, -sin_theta],
+                     [sin_theta, cos_theta]], device=device)
     
-    Returns:
-        Rotated points tensor of shape [N, 2]
-    """
-    # Create batch rotation matrices of shape [N, 2, 2]
-    cos_theta = torch.cos(angles)
-    sin_theta = torch.sin(angles)
-    
-    # Stack into batch of 2x2 rotation matrices
-    R = torch.stack([
-        torch.stack([cos_theta, -sin_theta], dim=1),
-        torch.stack([sin_theta, cos_theta], dim=1)
-    ], dim=1)  # Shape: [N, 2, 2]
-    
-    # Reshape x to [N, 2, 1] for batch matrix multiplication
-    x_reshaped = x.unsqueeze(-1)  # Shape: [N, 2, 1]
-    
-    # Apply rotations and reshape back
-    rotated = torch.bmm(R, x_reshaped)  # Shape: [N, 2, 1]
-    return rotated.squeeze(-1)  # Shape: [N, 2]
-
+    def rotate_points(points):
+        """
+        Rotate points by the sampled angle
+        Args:
+            points: Tensor of shape [batch_size, 2] containing 2D points
+        Returns:
+            Rotated points of same shape
+        """
+        return torch.matmul(points, R.T)
+        
+    return angle, rotate_points
 
 class PointDiffusion:
     def __init__(self, point_dim, n_steps=1000, device="cuda"):
@@ -220,7 +158,7 @@ class PointDiffusion:
         x_t = torch.sqrt(a_bar) * x_0 + torch.sqrt(1 - a_bar) * eps
         
         return x_t, eps
-    def train_step(self, x_0, k_steps=1, lambda_equiv=10):
+    def train_step(self, x_0, k_steps=10, lambda_equiv=10):
         """Single training step with equivariance loss"""
         # Sample random timesteps
         t = torch.randint(0, self.n_steps, (x_0.shape[0],)).to(self.device)
@@ -228,48 +166,36 @@ class PointDiffusion:
         # Add noise to points
         x_t, noise = self.diffuse_points(x_0, t)
         
+        # Sample random rotation angle and get rotation function
+        angle, rotate_fn = sample_rotation(device=self.device)
+        
+        # Path 1: Rotate -> Denoise k times
+        x_path1 = rotate_fn(x_t)
+        for _ in range(k_steps):
+            noise_pred = self.model(x_path1, t.float() / self.n_steps)
+            alpha = self.alpha[t].view(-1, 1)  # Reshape to [batch_size, 1]
+            alpha_bar = self.alpha_bar[t].view(-1, 1)  # Reshape to [batch_size, 1]
+            x_path1 = 1 / torch.sqrt(alpha) * (
+                x_path1 - (1 - alpha) / torch.sqrt(1 - alpha_bar) * noise_pred
+            )
+        
+        # Path 2: Denoise k times -> Rotate
+        x_path2 = x_t
+        for _ in range(k_steps):
+            noise_pred = self.model(x_path2, t.float() / self.n_steps)
+            alpha = self.alpha[t].view(-1, 1)  # Reshape to [batch_size, 1]
+            alpha_bar = self.alpha_bar[t].view(-1, 1)  # Reshape to [batch_size, 1]
+            x_path2 = 1 / torch.sqrt(alpha) * (
+                x_path2 - (1 - alpha) / torch.sqrt(1 - alpha_bar) * noise_pred
+            )
+        x_path2 = rotate_fn(x_path2)
+        
         # Calculate standard denoising loss (using single step prediction)
         noise_pred = self.model(x_t, t.float() / self.n_steps)
         denoising_loss = nn.MSELoss()(noise_pred, noise)
         
-        # Calculate equivariance loss
-        equivariance_loss = torch.tensor(0.0).to(self.device)
-        
-        # Create mask for timesteps where we apply equivariance loss
-        # Only apply equivariance loss to certain timestep range
-        mask = t > 20
-        
-        if mask.any():
-            # Sample random rotation angle
-            angles = torch.rand(x_0.shape[0], device=self.device) * 2 * torch.pi
-            
-            # Path 1: Rotate -> Denoise k times
-            x_path1 = sample_rotation(angles, x_t, device=self.device)
-            for _ in range(k_steps):
-                noise_pred = self.model(x_path1, t.float() / self.n_steps)
-                alpha = self.alpha[t].view(-1, 1)
-                alpha_bar = self.alpha_bar[t].view(-1, 1)
-                x_path1 = 1 / torch.sqrt(alpha) * (
-                    x_path1 - (1 - alpha) / torch.sqrt(1 - alpha_bar) * noise_pred
-                )
-            
-            # Path 2: Denoise k times -> Rotate
-            x_path2 = x_t
-            for _ in range(k_steps):
-                noise_pred = self.model(x_path2, t.float() / self.n_steps)
-                alpha = self.alpha[t].view(-1, 1)
-                alpha_bar = self.alpha_bar[t].view(-1, 1)
-                x_path2 = 1 / torch.sqrt(alpha) * (
-                    x_path2 - (1 - alpha) / torch.sqrt(1 - alpha_bar) * noise_pred
-                )
-            x_path2 = sample_rotation(angles, x_path2, device=self.device)
-            
-            # Calculate equivariance loss between the two paths, but only for masked timesteps
-            x_path1_masked = x_path1[mask]
-            x_path2_masked = x_path2[mask]
-            
-            if x_path1_masked.shape[0] > 0:
-                equivariance_loss = nn.MSELoss()(x_path1_masked, x_path2_masked)
+        # Calculate equivariance loss between the two paths
+        equivariance_loss = nn.MSELoss()(x_path1, x_path2)
         
         # Combine losses with weighting
         total_loss = denoising_loss + lambda_equiv * equivariance_loss
@@ -532,27 +458,6 @@ def plot_score_errors(diffusion_model: PointDiffusion,
     plt.tight_layout()
     return fig
 
-def compute_vector_field_error(field1, field2):
-    """
-    Compute average error between two vector fields using component-wise difference.
-    
-    Args:
-        field1, field2: Arrays of shape (grid_size, grid_size, 2) containing vector components
-    
-    Returns:
-        Scalar value representing average error across all grid points
-    """
-    # Compute component-wise differences
-    diff_field = field1 - field2
-    
-    # Compute magnitude of difference vectors
-    error_map = np.sqrt(diff_field[..., 0]**2 + diff_field[..., 1]**2)
-    
-    # Average across all points in the grid
-    mean_error = np.mean(error_map)
-    
-    return mean_error
-
 # Example usage:
 if __name__ == "__main__":
     # Setup save directory
@@ -599,81 +504,33 @@ if __name__ == "__main__":
     total_losses = []
     denoising_losses = []
     equivariance_losses = []
-
-    score_errors = []
-
-    timestep = 48
-    lambda_equiv = 4000
-
-    for epoch in range(2000):
-        loss_dict = diffusion_equivariant.train_step(points, lambda_equiv=lambda_equiv, k_steps=1)
+    
+    for epoch in range(1000):
+        loss_dict = diffusion_equivariant.train_step(points, lambda_equiv=50, k_steps=1)
         total_losses.append(loss_dict['total_loss'])
         denoising_losses.append(loss_dict['denoising_loss'])
         equivariance_losses.append(loss_dict['equivariance_loss'])
         
-        if epoch % 10 == 0:
+        if epoch % 100 == 0:
             print(f"Equivariant Model - Epoch {epoch}, "
                   f"Total Loss: {loss_dict['total_loss']:.6f}, "
                   f"Denoising Loss: {loss_dict['denoising_loss']:.6f}, "
                   f"Equivariance Loss: {loss_dict['equivariance_loss']:.6f}")
-
-            _, _, score_std_x, score_std_y = compute_score_field(diffusion_standard, timestep=timestep)
-            _, _, score_equiv_x, score_equiv_y = compute_score_field(diffusion_equivariant, timestep=timestep)
-
-            # Stack components into 3D arrays
-            field_std = np.stack([score_std_x, score_std_y], axis=-1)
-            field_equiv = np.stack([score_equiv_x, score_equiv_y], axis=-1)
-
-            # Compute error
-            error = compute_vector_field_error(field_std, field_equiv)
-            score_errors.append(error)
     
-    # Plot training curves in a compound figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-
-    # Plot original points for reference
-    points_np = points.cpu().numpy()
-    plt.figure(figsize=(8, 5))
-    plt.scatter(points_np[:, 0], points_np[:, 1], s=10, c='blue', alpha=0.5, label='Original Data')
-    plt.title("Original Training Data")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.xlim(xlim)  # Match x limits with score field plots
-    plt.ylim(ylim)  # Match y limits with score field plots
-    plt.grid(True)
+    # Plot training curves
+    plt.figure(figsize=(10, 5))
+    plt.plot(standard_losses, label='Standard Model Loss')
+    plt.plot(total_losses, label='Equivariant Total Loss')
+    plt.plot(denoising_losses, label='Equivariant Denoising Loss')
+    plt.plot(equivariance_losses, label='Equivariant Rotation Loss')
+    plt.title("Training Losses")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.legend()
-    plt.savefig(os.path.join(save_dir, "original_data.png"))
-    plt.close()
-    # Left subplot - Main losses
-    ax1.plot(standard_losses, label='Standard Model Loss')
-    ax1.plot(total_losses, label='Equivariant Total Loss')
-    ax1.plot(denoising_losses, label='Equivariant Denoising Loss')
-    ax1.set_title("Main Training Losses")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Loss")
-    ax1.legend()
-    
-    # Right subplot - Equivariance loss only
-    ax2.plot(equivariance_losses, color='red', label='Equivariant Rotation Loss')
-    ax2.set_title("Equivariance Loss")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Loss")
-    ax2.legend()
-    
-    plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "training_losses_comparison.png"))
     plt.close()
 
-    # Plot score errors over training
-    plt.figure(figsize=(8, 5))
-    plt.plot(score_errors, label='Score Field Error')
-    plt.title("Score Field Error Between Models")
-    plt.xlabel("Epoch (x10)") # Since we compute error every 10 epochs
-    plt.ylabel("Error")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, "score_field_error.png"))
-    plt.close()
+    timestep = 48
 
     # Compare score fields between models
     for model, name in [(diffusion_standard, "standard"), 
@@ -724,14 +581,15 @@ if __name__ == "__main__":
     
     # Compute magnitude difference
     mag_diff = np.abs(norms_equiv - norms_std).reshape(50, 50)
+    
     # Plot differences
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
-    im1 = ax1.pcolormesh(xx, yy, angle_diff, shading='auto', vmin=0, vmax=6)
+    im1 = ax1.pcolormesh(xx, yy, angle_diff, shading='auto')
     ax1.set_title('Angle Difference (radians)')
     plt.colorbar(im1, ax=ax1)
     
-    im2 = ax2.pcolormesh(xx, yy, mag_diff, shading='auto', vmin=0, vmax=6)
+    im2 = ax2.pcolormesh(xx, yy, mag_diff, shading='auto')
     ax2.set_title('Magnitude Difference')
     plt.colorbar(im2, ax=ax2)
     
@@ -761,178 +619,5 @@ if __name__ == "__main__":
     # }
     # with open(os.path.join(save_dir, "parameters.json"), "w") as f:
     #     json.dump(params, f, indent=4)
-
-    indices = [i for i in range(num_steps)]
-    mses = []
-    n_sample = 100
-    # Generate random noise for point diffusion model
-    initial_noise = torch.randn(n_sample, 2).to(diffusion_equivariant.device)
-
-    # Test rotation angles from 0 to 360 degrees in 30-degree increments
-    rotation_angles = list(range(0, 361, 30))
-    
-    for rotation_angle in rotation_angles:
-        print(f"Testing rotation angle: {rotation_angle}°")
-        mses = []
-        
-        for index in indices:
-            torch.manual_seed(42)
-            torch.cuda.manual_seed(42)
-
-            # Sample from timestep 400 down to INDEX
-            initial_noise = torch.randn(n_sample, 2).to(diffusion_equivariant.device)
-            intermediate_i, intermediate_store = sample_steps(
-                model=diffusion_equivariant,
-                x_i=initial_noise,
-                n_sample=n_sample,
-                size=(2,),
-                start_timestep=index,
-                end_timestep=num_steps
-            )
-
-            # Continue sampling from INDEX to 1
-            x_i, x_i_store = sample_steps(
-                model=diffusion_equivariant,
-                x_i=intermediate_i,  # Use the intermediate result
-                n_sample=n_sample,
-                size=(2,),
-                start_timestep=1,
-                end_timestep=index
-            )
-
-            # Apply rotation to points using the point rotation function
-            rotation_rad = rotation_angle * (torch.pi / 180.0)
-            angles = torch.ones(n_sample, device=diffusion_equivariant.device) * rotation_rad
-            x_i = sample_rotation(angles, x_i, device=diffusion_equivariant.device)
-
-            # First rotate the intermediate result using point rotation
-            rotation_rad = rotation_angle * (torch.pi / 180.0)
-            angles = torch.ones(n_sample, device=diffusion_equivariant.device) * rotation_rad
-            transformed_i = sample_rotation(angles, intermediate_i, device=diffusion_equivariant.device)
-            # Then continue sampling
-            x_i_transformed, x_i_transformed_store = sample_steps(
-                model=diffusion_equivariant,
-                x_i=transformed_i,  # Use the rotated intermediate result
-                n_sample=n_sample,
-                size=(2,),
-                start_timestep=1,
-                end_timestep=index
-            )
-
-            with torch.no_grad():
-                loss = nn.MSELoss()(x_i, x_i_transformed)
-                mses.append(loss.cpu().item())
-
-        # Store results for each angle in a dictionary
-        if not hasattr(plt, 'angle_results'):
-            plt.angle_results = {}
-        
-        # Save the results for this angle
-        plt.angle_results[rotation_angle] = {
-            'timesteps': [num_steps - i for i in indices],
-            'mses': mses
-        }
-    
-    # Create a single plot with all angles
-    plt.figure(figsize=(10, 6))
-    for angle, data in plt.angle_results.items():
-        plt.plot(data['timesteps'], data['mses'], label=f'{angle}° rotation')
-    
-    plt.xlabel('Timestep')
-    plt.ylabel('MSE between paths')
-    plt.legend()
-    plt.title('Equivariance Error at Different Rotation Angles')
-    plt.savefig(f'{save_dir}/all_angles_comparison.png', 
-                bbox_inches='tight', dpi=300)
-    plt.close()
-
-    # Single-step equivariance comparison
-    print("Testing single-step equivariance...")
-    single_step_angle_results = {}
-    
-    # Test rotation angles from 0 to 360 degrees in 30-degree increments
-    rotation_angles = list(range(0, 361, 30))
-    
-    for rotation_angle in rotation_angles:
-        print(f"Testing single-step rotation angle: {rotation_angle}°")
-        single_step_mses = []
-        
-        for index in indices:
-            torch.manual_seed(42)
-            torch.cuda.manual_seed(42)
-            
-            # Sample from timestep num_steps down to index
-            initial_noise = torch.randn(n_sample, 2).to(diffusion_equivariant.device)
-            intermediate_i, _ = sample_steps(
-                model=diffusion_equivariant,
-                x_i=initial_noise,
-                n_sample=n_sample,
-                size=(2,),
-                start_timestep=index,
-                end_timestep=num_steps
-            )
-            
-            # Take just one denoising step from index to index-1
-            if index > 0:
-                # Create time tensor for current timestep
-                t_tensor = torch.ones(n_sample, device=diffusion_equivariant.device) * index
-                
-                # Path 1: Rotate then denoise one step
-                rotation_rad = rotation_angle * (torch.pi / 180.0)
-                angles = torch.ones(n_sample, device=diffusion_equivariant.device) * rotation_rad
-                rotated_i = sample_rotation(angles, intermediate_i, device=diffusion_equivariant.device)
-                
-                # Predict noise for rotated points
-                eps_theta_1 = diffusion_equivariant.model(rotated_i, t_tensor.float() / diffusion_equivariant.n_steps)
-                
-                # Update rotated points with one denoising step
-                alpha = diffusion_equivariant.alpha[index]
-                alpha_bar = diffusion_equivariant.alpha_bar[index]
-                beta = diffusion_equivariant.beta[index]
-                
-                # Add noise only if not at the final step
-                z = torch.randn(n_sample, 2).to(diffusion_equivariant.device) if index > 1 else 0
-                
-                path1_result = 1 / torch.sqrt(alpha) * (
-                    rotated_i - (1 - alpha) / torch.sqrt(1 - alpha_bar) * eps_theta_1
-                ) + torch.sqrt(beta) * z
-                
-                # Path 2: Denoise one step then rotate
-                eps_theta_2 = diffusion_equivariant.model(intermediate_i, t_tensor.float() / diffusion_equivariant.n_steps)
-                
-                # Update original points with one denoising step
-                path2_pre_rotation = 1 / torch.sqrt(alpha) * (
-                    intermediate_i - (1 - alpha) / torch.sqrt(1 - alpha_bar) * eps_theta_2
-                ) + torch.sqrt(beta) * z
-                
-                # Then rotate
-                path2_result = sample_rotation(angles, path2_pre_rotation, device=diffusion_equivariant.device)
-                
-                # Compute MSE between the two paths
-                with torch.no_grad():
-                    loss = nn.MSELoss()(path1_result, path2_result)
-                    single_step_mses.append(loss.cpu().item())
-            else:
-                # For index 0, just append 0 (no denoising step possible)
-                single_step_mses.append(0)
-        
-        # Store results for this angle
-        single_step_angle_results[rotation_angle] = {
-            'timesteps': [num_steps - i for i in indices],
-            'mses': single_step_mses
-        }
-    
-    # Create plot with all angles for single-step comparison
-    plt.figure(figsize=(10, 6))
-    for angle, data in single_step_angle_results.items():
-        plt.plot(data['timesteps'], data['mses'], label=f'{angle}° rotation')
-    
-    plt.xlabel('Timestep')
-    plt.ylabel('Single-Step MSE between paths')
-    plt.legend()
-    plt.title(f'Single-Step Equivariance Error at Different Rotation Angles (λ={lambda_equiv})')
-    plt.savefig(f'{save_dir}/single_step_angles_comparison.png', 
-                bbox_inches='tight', dpi=300)
-    plt.close()
 
     print(f"All results saved in: {save_dir}")
