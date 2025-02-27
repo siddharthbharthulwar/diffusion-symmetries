@@ -220,8 +220,8 @@ class PointDiffusion:
         x_t = torch.sqrt(a_bar) * x_0 + torch.sqrt(1 - a_bar) * eps
         
         return x_t, eps
-    def train_step(self, x_0, k_steps=1, lambda_equiv=10):
-        """Single training step with equivariance loss"""
+    def train_step(self, x_0, k_steps=1, lambda_equiv=10, timestep_mask=None):
+        """Single training step with equivariance loss and configurable timestep mask"""
         # Sample random timesteps
         t = torch.randint(0, self.n_steps, (x_0.shape[0],)).to(self.device)
         
@@ -236,8 +236,12 @@ class PointDiffusion:
         equivariance_loss = torch.tensor(0.0).to(self.device)
         
         # Create mask for timesteps where we apply equivariance loss
-        # Only apply equivariance loss to certain timestep range
-        mask = t > 20
+        # If timestep_mask is provided, use it; otherwise use default (t > 20)
+        if timestep_mask is None:
+            mask = t > 0
+        else:
+            # timestep_mask should be a function that takes t and returns a boolean mask
+            mask = timestep_mask(t)
         
         if mask.any():
             # Sample random rotation angle
@@ -282,7 +286,8 @@ class PointDiffusion:
         return {
             'total_loss': total_loss.item(),
             'denoising_loss': denoising_loss.item(),
-            'equivariance_loss': equivariance_loss.item()
+            'equivariance_loss': equivariance_loss.item(),
+            'timesteps': t.detach().cpu().numpy()  # Return the timesteps for analysis
         }
 
     @torch.no_grad()
@@ -553,6 +558,78 @@ def compute_vector_field_error(field1, field2):
     
     return mean_error
 
+def test_rotation_equivariance(diffusion_model, n_sample=100, rotation_angles=None):
+    """Test equivariance at different rotation angles"""
+    if rotation_angles is None:
+        rotation_angles = [0, 30, 60, 90, 180, 270]
+    
+    device = diffusion_model.device
+    results = {}
+    
+    for angle in rotation_angles:
+        # Generate random noise
+        torch.manual_seed(42)
+        initial_noise = torch.randn(n_sample, 2).to(device)
+        
+        # Sample from noise to data
+        x_final, _ = sample_steps(
+            model=diffusion_model,
+            x_i=initial_noise,
+            n_sample=n_sample,
+            size=(2,),
+            start_timestep=0,
+            end_timestep=diffusion_model.n_steps
+        )
+        
+        # Apply rotation to final result
+        rotation_rad = angle * (torch.pi / 180.0)
+        angles = torch.ones(n_sample, device=device) * rotation_rad
+        x_rotated = sample_rotation(angles, x_final, device=device)
+        
+        # Apply rotation to initial noise, then sample
+        rotated_noise = sample_rotation(angles, initial_noise, device=device)
+        x_from_rotated, _ = sample_steps(
+            model=diffusion_model,
+            x_i=rotated_noise,
+            n_sample=n_sample,
+            size=(2,),
+            start_timestep=0,
+            end_timestep=diffusion_model.n_steps
+        )
+        
+        # Compute error
+        with torch.no_grad():
+            error = nn.MSELoss()(x_rotated, x_from_rotated).item()
+        
+        results[angle] = error
+    
+    return results
+
+def compute_score_field_error(diffusion_model, timestep=None):
+    """Compute error between learned score field and true score field"""
+    if timestep is None:
+        timestep = diffusion_model.n_steps // 2  # Middle timestep
+    
+    # Compute learned score field
+    xx, yy, score_x, score_y = compute_score_field(
+        diffusion_model, 
+        timestep=timestep,
+        x_range=(-3.5, 3.5),
+        y_range=(-3.5, 3.5)
+    )
+    
+    # Reshape grid points for true score computation
+    grid_points = np.stack([xx.flatten(), yy.flatten()], axis=1)
+    
+    # Get true scores (assuming circle dataset with radius=5)
+    true_scores = true_score(grid_points, R=5.0, sigma=0.1)
+    learned_scores = np.stack([score_x.flatten(), score_y.flatten()], axis=1)
+    
+    # Compute error
+    error = np.mean(np.sqrt(np.sum((true_scores - learned_scores)**2, axis=1)))
+    
+    return error
+
 # Example usage:
 if __name__ == "__main__":
     # Setup save directory
@@ -561,7 +638,7 @@ if __name__ == "__main__":
     
     # Create synthetic 2D point data
     points = circle_dataset(n=1000, radius=5, noise=0.1,
-                          angle_intervals=[(0, 10)])
+                          angle_intervals=[(0, 270)])
     points = points.cuda()
 
     points_full = circle_dataset(n=1000, radius=5, noise=0.1, angle_intervals=[(0, 360)])
@@ -603,10 +680,10 @@ if __name__ == "__main__":
     score_errors = []
 
     timestep = 48
-    lambda_equiv = 4000
+    lambda_equiv = 0
 
     for epoch in range(2000):
-        loss_dict = diffusion_equivariant.train_step(points, lambda_equiv=lambda_equiv, k_steps=1)
+        loss_dict = diffusion_equivariant.train_step(points, lambda_equiv=lambda_equiv, k_steps=5)
         total_losses.append(loss_dict['total_loss'])
         denoising_losses.append(loss_dict['denoising_loss'])
         equivariance_losses.append(loss_dict['equivariance_loss'])
@@ -841,7 +918,7 @@ if __name__ == "__main__":
     plt.xlabel('Timestep')
     plt.ylabel('MSE between paths')
     plt.legend()
-    plt.title('Equivariance Error at Different Rotation Angles')
+    plt.title(f'Equivariance Error at Different Rotation Angles (λ={lambda_equiv})')
     plt.savefig(f'{save_dir}/all_angles_comparison.png', 
                 bbox_inches='tight', dpi=300)
     plt.close()
